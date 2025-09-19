@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python4
 """
 Py2Win Premium v5.0.0 - Enterprise Python to Windows Executable Builder
 Production-grade GUI application for packaging Python projects into Windows executables and installers.
@@ -13,35 +13,66 @@ import ast
 import shutil
 import zipfile
 import urllib.request
-import urllib.parse
 import time
 import threading
 import queue
 import subprocess
 import logging
 import tempfile
-import webbrowser
 import hashlib
-import winreg
-import base64
-import ctypes
 import configparser
 from pathlib import Path
 from dataclasses import dataclass, asdict, field
-from typing import Dict, List, Optional, Callable, Any, Tuple, Union
+from typing import Dict, List, Optional, Callable, Any, Tuple
 from datetime import datetime
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
+# Cryptography Fernet: provide typing hint for static checkers and a safe runtime import
+# cryptography.Fernet availability: try import, otherwise provide a runtime stub and HAVE_FERNET flag
+HAVE_FERNET = False
+try:
+    import importlib
+    _mod = importlib.import_module('cryptography.fernet')
+    Fernet = getattr(_mod, 'Fernet')
+    HAVE_FERNET = True
+except Exception:
+    HAVE_FERNET = False
+    # Provide a small stub so references to Fernet don't break runtime parsing
+    class Fernet:  # type: ignore
+        @staticmethod
+        def generate_key() -> bytes:
+            return b""
+
+        def __init__(self, key: bytes):
+            pass
+
+        def encrypt(self, data: bytes) -> bytes:  # pragma: no cover - stub
+            raise RuntimeError("cryptography.Fernet not available")
+
+        def decrypt(self, token: bytes) -> bytes:  # pragma: no cover - stub
+            raise RuntimeError("cryptography.Fernet not available")
 
 try:
     import customtkinter as ctk
-    from PIL import Image
 except ImportError:
     print("Installing required dependencies...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "customtkinter", "pillow"])
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "customtkinter"])
     import customtkinter as ctk
-    from PIL import Image
+
+# Windows-specific modules
+win32crypt = None
+if sys.platform == 'win32':
+    try:
+        import win32crypt  # type: ignore
+    except ImportError:
+        try:
+            print("Installing pywin32 for Windows DPAPI support...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "pywin32>=306"])
+            import win32crypt  # type: ignore
+        except (subprocess.CalledProcessError, ImportError) as e:
+            print(f"Warning: Could not install/import pywin32: {e}")
+            # Continue without win32crypt - secure storage will fall back to file-based encryption
 
 # Constants
 APP_NAME = "Py2Win Premium"
@@ -114,8 +145,8 @@ class InstallerConfig:
     start_menu: bool = True
     install_dir: str = ""  # Empty means auto-detect
     per_user: bool = False
-    eula_file: str = ""
-    banner_image: str = ""
+    eula_file: Optional[str] = None
+    banner_image: Optional[str] = None
     silent_mode: bool = False
 
 @dataclass
@@ -158,6 +189,33 @@ class ProjectConfig:
     signing: Optional[SigningConfig] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'ProjectConfig':
+        """Create ProjectConfig from dictionary"""
+        config = cls()
+        if not data:
+            return config
+            
+        if 'project' in data:
+            config.project = ProjectInfo(**data['project'])
+        if 'build_profiles' in data:
+            config.build_profiles = {
+                name: BuildConfig(**profile)
+                for name, profile in data['build_profiles'].items()
+            }
+        if 'active_profile' in data:
+            config.active_profile = data['active_profile']
+        if 'advanced' in data:
+            config.advanced = AdvancedConfig(**data['advanced'])
+        if 'installer' in data:
+            config.installer = InstallerConfig(**data['installer'])
+        if 'signing' in data:
+            config.signing = SigningConfig(**data['signing'])
+        if 'metadata' in data:
+            config.metadata = data['metadata']
+            
+        return config
+    
     def __post_init__(self):
         """Initialize with default profile if none exists"""
         if not self.build_profiles:
@@ -173,7 +231,7 @@ class ProjectConfig:
         """Set the active build configuration"""
         self.build_profiles[self.active_profile] = value
     
-    def add_profile(self, name: str, config: BuildConfig = None) -> bool:
+    def add_profile(self, name: str, config: Optional[BuildConfig] = None) -> bool:
         """Add a new build profile"""
         if name in self.build_profiles:
             return False
@@ -197,22 +255,27 @@ class ProjectConfig:
         return True
 
 class SecureStorage:
-    """Secure storage for sensitive data using Windows DPAPI"""
+    """Secure storage for sensitive data using Windows DPAPI or fallback encryption"""
     
     def __init__(self):
-        try:
-            import win32crypt  # type: ignore
-            self._available = True
-        except ImportError:
-            self._available = False
+        self._available = win32crypt is not None
     
+    def get_password(self, key: str) -> Optional[str]:
+        """Retrieve password securely (alias for backward compatibility)"""
+        return self.retrieve_password(key)
+
     def store_password(self, key: str, password: str) -> bool:
-        """Store password securely"""
-        if not self._available or not password:
+        """Store password securely using Windows DPAPI"""
+        if not password:
             return False
-        
+            
+        if not self._available:
+            return self._store_password_fallback(key, password)
+            
         try:
-            import win32crypt  # type: ignore
+            if win32crypt is None:  # Type checking helper
+                return False
+                
             encrypted_data = win32crypt.CryptProtectData(
                 password.encode('utf-8'),
                 f"Py2Win {key}",
@@ -223,26 +286,82 @@ class SecureStorage:
             with open(storage_file, 'wb') as f:
                 f.write(encrypted_data)
             return True
-        except Exception:
-            return False
+        except Exception as e:
+            logging.warning(f"Failed to store password using DPAPI: {e}")
+            return self._store_password_fallback(key, password)
     
     def retrieve_password(self, key: str) -> Optional[str]:
-        """Retrieve password securely"""
+        """Retrieve password using Windows DPAPI"""
         if not self._available:
-            return None
-        
+            return self._retrieve_password_fallback(key)
+            
         try:
-            import win32crypt  # type: ignore
+            if win32crypt is None:  # Type checking helper
+                return None
+                
             storage_file = CONFIG_DIR / f"{key}.dat"
             if not storage_file.exists():
                 return None
-            
+                
             with open(storage_file, 'rb') as f:
                 encrypted_data = f.read()
             
             decrypted_data = win32crypt.CryptUnprotectData(encrypted_data, None, None, None, 0)
             return decrypted_data[1].decode('utf-8')
-        except Exception:
+        except Exception as e:
+            logging.warning(f"Failed to retrieve password using DPAPI: {e}")
+            return self._retrieve_password_fallback(key)
+            
+    def _store_password_fallback(self, key: str, password: str) -> bool:
+        """Fallback storage using basic encryption when DPAPI is unavailable"""
+        if not HAVE_FERNET:
+            return False
+            
+        try:
+            key_file = CONFIG_DIR / ".keyfile"
+            if not key_file.exists():
+                fernet_key = Fernet.generate_key()
+                with open(key_file, 'wb') as f:
+                    f.write(fernet_key)
+            else:
+                with open(key_file, 'rb') as f:
+                    fernet_key = f.read()
+                    
+            f = Fernet(fernet_key)
+            encrypted = f.encrypt(password.encode('utf-8'))
+            storage_file = CONFIG_DIR / f"{key}.enc"
+            with open(storage_file, 'wb') as f:
+                f.write(encrypted)
+            return True
+        except Exception as e:
+            logging.error(f"Failed to store password using fallback encryption: {e}")
+            return False
+            
+    def _retrieve_password_fallback(self, key: str) -> Optional[str]:
+        """Fallback retrieval using basic encryption when DPAPI is unavailable"""
+        if not HAVE_FERNET:
+            return None
+            
+        try:
+            key_file = CONFIG_DIR / ".keyfile"
+            if not key_file.exists():
+                return None
+                
+            with open(key_file, 'rb') as f:
+                fernet_key = f.read()
+                
+            storage_file = CONFIG_DIR / f"{key}.enc"
+            if not storage_file.exists():
+                return None
+                
+            with open(storage_file, 'rb') as f:
+                encrypted = f.read()
+                
+            f = Fernet(fernet_key)
+            decrypted = f.decrypt(encrypted)
+            return decrypted.decode('utf-8')
+        except Exception as e:
+            logging.error(f"Failed to retrieve password using fallback encryption: {e}")
             return None
 
 class RotatingLogger:
@@ -254,6 +373,11 @@ class RotatingLogger:
         self.log_queue = queue.Queue()
         self.setup_logger()
     
+    @property
+    def log(self):
+        """Property to access logger directly"""
+        return self.logger
+
     def setup_logger(self):
         """Setup rotating file and GUI logger"""
         self.logger = logging.getLogger('Py2Win')
@@ -279,7 +403,16 @@ class RotatingLogger:
         
         # Queue handler for GUI
         queue_handler = logging.Handler()
-        queue_handler.emit = lambda record: self.log_queue.put(console_formatter.format(record))
+        def _emit_to_queue(record):
+            try:
+                msg = console_formatter.format(record)
+                # Ensure string messages only
+                if not isinstance(msg, str):
+                    msg = str(msg)
+                self.log_queue.put(msg)
+            except Exception:
+                pass
+        queue_handler.emit = _emit_to_queue
         
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
@@ -337,6 +470,23 @@ class RotatingLogger:
             result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
         return result
 
+    # Backwards-compatibility: make RotatingLogger callable and proxy attributes
+    def __call__(self, *args, **kwargs):
+        """Allow calling the logger like a function (proxy to info)."""
+        try:
+            if args:
+                self.info(str(args[0]), *args[1:], **kwargs)
+        except Exception:
+            pass
+
+    def __getattr__(self, item):
+        # Forward unknown attributes to internal logger if present
+        if '_logger' in self.__dict__ and hasattr(self.__dict__['_logger'], item):
+            return getattr(self.__dict__['_logger'], item)
+        if hasattr(self, 'logger') and hasattr(self.logger, item):
+            return getattr(self.logger, item)
+        raise AttributeError(item)
+
 class ChecksumValidator:
     """Validates file checksums and handles retries"""
     
@@ -354,11 +504,12 @@ class ChecksumValidator:
     
     @staticmethod
     def download_with_verification(url: str, file_path: Path, expected_hash: str, 
-                                 mirrors: List[str] = None, progress_callback: Callable = None) -> bool:
+                                 mirrors: Optional[List[str]] = None,
+                                 progress_callback: Optional[Callable[[str], Any]] = None) -> bool:
         """Download file with checksum verification and mirror fallback"""
         urls_to_try = [url] + (mirrors or [])
         
-        for attempt, download_url in enumerate(urls_to_try):
+        for _, download_url in enumerate(urls_to_try):
             try:
                 # Download with progress
                 response = urllib.request.urlopen(download_url, timeout=30)
@@ -410,7 +561,7 @@ class DependencyAnalyzer:
             return str(pip_path)
         return "pip"
     
-    def full_diagnosis(self) -> Dict[str, Any]:
+    def full_diagnosis(self, script_path: Optional[str] = None) -> Dict[str, Any]:
         """Comprehensive dependency analysis"""
         results = {
             'python_version': self._check_python_version(),
@@ -518,7 +669,7 @@ class DependencyAnalyzer:
                     conflicts.append({'description': issue, 'severity': 'high'})
         return conflicts
     
-    def install_packages(self, packages: List[str], progress_callback: Callable = None) -> bool:
+    def install_packages(self, packages: List[str], progress_callback: Optional[Callable[[str], Any]] = None) -> bool:
         """Install packages with progress tracking"""
         try:
             cmd = [self.pip_exe, "install", "--upgrade"] + packages
@@ -531,7 +682,8 @@ class DependencyAnalyzer:
                 text=True, bufsize=1, universal_newlines=True
             )
             
-            for line in process.stdout:
+            out = process.stdout or []
+            for line in out:
                 line = line.strip()
                 if line:
                     self.logger.info(line)
@@ -551,6 +703,17 @@ class DependencyAnalyzer:
         except Exception as e:
             self.logger.error(f"Package installation error: {str(e)}")
             return False
+
+    def get_dependencies(self, script_path: str, include_runtime: bool = True) -> List[str]:
+        """Detect dependencies for a script using HiddenImportDetector and return a flat list"""
+        try:
+            detector = HiddenImportDetector()
+            detected = detector.detect_imports(script_path, include_runtime=include_runtime)
+            deps = list(set(detected.get('static', []) + detected.get('dynamic', [])))
+            return deps
+        except Exception as e:
+            self.logger.error(f"Failed to get dependencies: {e}")
+            return []
 
 class HiddenImportDetector:
     """Advanced hidden import detection with AST and runtime analysis"""
@@ -617,6 +780,10 @@ class HiddenImportDetector:
             self.logger.error(f"Import detection failed: {str(e)}")
         
         return results
+
+    def get_dependencies(self, script_path: str, include_runtime: bool = True) -> Dict[str, List[str]]:
+        """Backward-compatible alias for detect_imports"""
+        return self.detect_imports(script_path, include_runtime=include_runtime)
     
     def _static_analysis(self, script_path: str) -> List[str]:
         """Analyze imports using AST"""
@@ -670,7 +837,8 @@ class HiddenImportDetector:
                 finder.run_script(script_path)
                 
                 for name, mod in finder.modules.items():
-                    if mod.__file__ and not self._is_stdlib(name):
+                    mod_file = getattr(mod, '__file__', None)
+                    if mod_file and not self._is_stdlib(name):
                         dynamic_imports.add(name.split('.')[0])
             except:
                 pass
@@ -718,7 +886,7 @@ class HiddenImportDetector:
                 dynamic_imports.update(['pkg_resources', 'setuptools', 'importlib_metadata'])
             
         except Exception as e:
-            self.logger.log(f"Dynamic analysis error: {e}", "WARNING")
+            self.logger.warning(f"Dynamic analysis error: {e}")
             # Fallback to basic runtime imports
             dynamic_imports.update([
                 'pkg_resources', 'importlib_metadata', 'setuptools',
@@ -764,7 +932,7 @@ class BuildOrchestrator:
         self.current_process = None
         self.cancel_event = threading.Event()
     
-    def build(self, config: BuildConfig, progress_callback: Callable = None) -> bool:
+    def build(self, config: BuildConfig, progress_callback: Optional[Callable[[str], Any]] = None) -> bool:
         """Build executable with specified backend"""
         if not config.script_path or not Path(config.script_path).exists():
             self.logger.error(f"Script path not found: {config.script_path}")
@@ -887,7 +1055,7 @@ class BuildOrchestrator:
                 except Exception as e:
                     self.logger.warning(f"Could not clean {dir_path}: {str(e)}")
     
-    def _build_with_pyinstaller(self, config: BuildConfig, progress_callback: Callable = None) -> bool:
+    def _build_with_pyinstaller(self, config: BuildConfig, progress_callback: Optional[Callable[[str], Any]] = None) -> bool:
         """Build with PyInstaller"""
         try:
             # Create version file
@@ -909,7 +1077,7 @@ class BuildOrchestrator:
             self.logger.error(f"PyInstaller build failed: {str(e)}")
             return False
     
-    def _build_with_nuitka(self, config: BuildConfig, progress_callback: Callable = None) -> bool:
+    def _build_with_nuitka(self, config: BuildConfig, progress_callback: Optional[Callable[[str], Any]] = None) -> bool:
         """Build with Nuitka"""
         try:
             # Check if Nuitka is available
@@ -1015,9 +1183,11 @@ VSVersionInfo(
                 else:
                     cmd.extend(["--add-data", f"{source};{target}"])
         
-        if config.use_upx and shutil.which("upx"):
-            cmd.append("--upx-dir")
-            cmd.append(str(Path(shutil.which("upx")).parent))
+        if config.use_upx:
+            upx_path = shutil.which("upx")
+            if upx_path:
+                cmd.append("--upx-dir")
+                cmd.append(str(Path(upx_path).parent))
         
         return cmd
     
@@ -1050,7 +1220,7 @@ VSVersionInfo(
         
         return cmd
     
-    def _execute_build_command(self, cmd: List[str], progress_callback: Callable = None) -> bool:
+    def _execute_build_command(self, cmd: List[str], progress_callback: Optional[Callable[[str], Any]] = None) -> bool:
         """Execute build command with progress tracking"""
         try:
             self.logger.info("Starting build process...")
@@ -1064,7 +1234,11 @@ VSVersionInfo(
                 bufsize=1,
                 universal_newlines=True
             )
-            
+
+            if self.current_process.stdout is None:
+                self.logger.error("Build process did not provide stdout")
+                return False
+
             while True:
                 if self.cancel_event.is_set():
                     self.current_process.terminate()
@@ -1103,7 +1277,7 @@ class NSISInstaller:
         self.logger = RotatingLogger()
         self.nsis_exe = NSIS_DIR / "nsis-3.09" / "makensis.exe"
     
-    def ensure_nsis(self, progress_callback: Callable = None) -> bool:
+    def ensure_nsis(self, progress_callback: Optional[Callable[[str], Any]] = None) -> bool:
         """Ensure NSIS is available, download if needed"""
         if self.nsis_exe.exists():
             self.logger.info("NSIS already available")
@@ -1141,10 +1315,26 @@ class NSISInstaller:
             self.logger.error(f"Failed to extract NSIS: {str(e)}")
             return False
     
-    def build_installer(self, installer_config: InstallerConfig, build_config: BuildConfig,
-                       signing_config: SigningConfig = None, progress_callback: Callable = None) -> bool:
-        
+    def build_installer(self, installer_config: Optional[InstallerConfig] = None, build_config: Optional[BuildConfig] = None,
+                       signing_config: Optional[SigningConfig] = None, progress_callback: Optional[Callable[[str], Any]] = None, **kwargs) -> bool:
+
         try:
+            # Backwards compatibility: callers may pass exe_path and config kwargs
+            if 'exe_path' in kwargs and 'config' in kwargs and installer_config is None and build_config is None:
+                exe_path = Path(kwargs.get('exe_path')) # type: ignore
+                installer_cfg = kwargs.get('config')
+                # Create a minimal BuildConfig from exe_path
+                build_cfg = BuildConfig(
+                    script_path=str(exe_path),
+                    exe_name=exe_path.stem,
+                    output_dir=str(exe_path.parent)
+                )
+                installer_config = installer_cfg
+                build_config = build_cfg
+
+            if installer_config is None or build_config is None:
+                self.logger.error("Installer or build configuration missing")
+                return False
             if not self.ensure_nsis(progress_callback):
                 return False
             
@@ -1183,7 +1373,7 @@ class NSISInstaller:
     
     def _validate_build_output(self, build_config: BuildConfig) -> bool:
         """Validate that build output exists"""
-        output_path = Path(build_config.output_dir) / f"{build_config.exe_name}.exe"
+        output_path = safe_path(getattr(build_config, 'output_dir', None)) / f"{build_config.exe_name}.exe"
         if not output_path.exists():
             self.logger.error(f"Build output not found: {output_path}")
             return False
@@ -1194,10 +1384,11 @@ class NSISInstaller:
         exe_name = f"{build_config.exe_name}.exe"
         install_dir = installer_config.install_dir or f"$PROGRAMFILES\\{installer_config.app_name}"
         
+        out_file_path = str(safe_path(getattr(installer_config, 'output_dir', None)) / f"{installer_config.app_name}_setup.exe")
         script = [
             '!include "MUI2.nsh"',
             f'Name "{installer_config.app_name}"',
-            f'OutFile "{Path(installer_config.output_dir) / f"{installer_config.app_name}_setup.exe"}"',
+            f'OutFile "{out_file_path}"',
             f'InstallDir "{install_dir}"',
             'RequestExecutionLevel ' + ('user' if installer_config.per_user else 'admin'),
             'Unicode True',
@@ -1218,7 +1409,7 @@ class NSISInstaller:
             '',
             'Section "Main" SEC01',
             '  SetOutPath "$INSTDIR"',
-            f'  File "{Path(build_config.output_dir) / exe_name}"',
+            f'  File "{str(safe_path(getattr(build_config, "output_dir", None)) / exe_name)}"',
         ])
         
         if installer_config.desktop_shortcut:
@@ -1242,7 +1433,7 @@ class NSISInstaller:
         
         return '\n'.join(script)
     
-    def _execute_nsis_build(self, script_path: Path, progress_callback: Callable = None) -> bool:
+    def _execute_nsis_build(self, script_path: Path, progress_callback: Optional[Callable[[str], Any]] = None) -> bool:
         """Execute NSIS build command"""
         cmd = [str(self.nsis_exe), str(script_path)]
         
@@ -1252,7 +1443,11 @@ class NSISInstaller:
         process = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, universal_newlines=True
         )
-        
+
+        if process.stdout is None:
+            self.logger.error("NSIS process did not provide stdout")
+            return False
+
         for line in iter(process.stdout.readline, ''):
             self.logger.info(line.strip())
             if progress_callback:
@@ -1263,9 +1458,13 @@ class NSISInstaller:
     
     def _get_installer_path(self, installer_config: InstallerConfig) -> str:
         """Get the path to the generated installer"""
-        return str(Path(installer_config.output_dir) / f"{installer_config.app_name}_setup.exe")
+        out_dir = safe_path(getattr(installer_config, 'output_dir', None))
+        return str(out_dir / f"{installer_config.app_name}_setup.exe")
     
-    def _sign_installer(self, installer_path: str, signing_config: SigningConfig, progress_callback: Callable = None) -> bool:
+    def _sign_installer(self, installer_path: str, signing_config: Optional[SigningConfig], progress_callback: Optional[Callable[[str], Any]] = None) -> bool:
+        if not signing_config:
+            self.logger.warning("No signing configuration provided; skipping signing")
+            return False
         """Sign the installer using signtool"""
         if progress_callback:
             progress_callback("Signing installer...")
@@ -1448,7 +1647,7 @@ class ProjectTemplates:
         }
     
     @staticmethod
-    def create_from_template(template_name: str, custom_values: Dict[str, Any] = None) -> ProjectConfig:
+    def create_from_template(template_name: str, custom_values: Optional[Dict[str, Any]] = None) -> ProjectConfig:
         """Create a project configuration from a template"""
         templates = ProjectTemplates.get_templates()
         if template_name not in templates:
@@ -1496,10 +1695,7 @@ class ProjectManager:
                 },
                 'build': asdict(config.build),
                 'installer': asdict(config.installer),
-                'signing': {
-                    **asdict(config.signing),
-                    'cert_password': ''  # Never save passwords
-                }
+                'signing': ({**asdict(config.signing), 'cert_password': ''} if config.signing else {}),
             }
             
             # Create backup if file exists
@@ -1522,10 +1718,11 @@ class ProjectManager:
             self.logger.error(f"Failed to save configuration: {str(e)}")
             return False
     
-    def load_config(self, file_path: str) -> Optional[ProjectConfig]:
+    def load_config(self, file_path: 'str | Path') -> Optional[ProjectConfig]:
         """Load project configuration from JSON file"""
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
+            fp = str(file_path)
+            with open(fp, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
             # Validate schema version
@@ -1536,14 +1733,13 @@ class ProjectManager:
             # Create config objects
             build_config = BuildConfig(**data.get('build', {}))
             installer_config = InstallerConfig(**data.get('installer', {}))
-            signing_config = SigningConfig(**data.get('signing', {}))
-            
-            config = ProjectConfig(
-                build=build_config,
-                installer=installer_config,
-                signing=signing_config,
-                metadata=data.get('metadata', {})
-            )
+            signing_config = SigningConfig(**data.get('signing')) if data.get('signing') else None
+
+            config = ProjectConfig()
+            config.build = build_config
+            config.installer = installer_config
+            config.signing = signing_config
+            config.metadata = data.get('metadata', {})
             
             self.logger.info(f"Configuration loaded: {file_path}")
             return config
@@ -1552,15 +1748,16 @@ class ProjectManager:
             self.logger.error(f"Failed to load configuration: {str(e)}")
             return None
     
-    def get_recent_configs(self, max_count: int = 5) -> List[str]:
-        """Get list of recently used configuration files"""
+    def get_recent_configs(self, max_count: int = 5) -> List[Path]:
+        """Get list of recently used configuration files as Path objects"""
         recent_file = CONFIG_DIR / "recent_configs.json"
         try:
             if recent_file.exists():
                 with open(recent_file, 'r') as f:
                     recent = json.load(f)
-                    # Filter existing files
-                    return [path for path in recent[:max_count] if Path(path).exists()]
+                    # Convert to Path and filter existing files
+                    paths = [Path(p) for p in recent[:max_count]]
+                    return [p for p in paths if p.exists()]
         except Exception:
             pass
         return []
@@ -1589,6 +1786,24 @@ class ProjectManager:
                 
         except Exception:
             pass  # Don't fail on recent files issues
+    def save_template(self, template_name: str, config: ProjectConfig) -> bool:
+        """Save a project configuration as a reusable template"""
+        try:
+            templates_dir = CONFIG_DIR / "templates"
+            templates_dir.mkdir(parents=True, exist_ok=True)
+            tpl_path = templates_dir / f"{template_name}.json"
+            tpl = {
+                'project': asdict(config.project),
+                'build': asdict(config.build),
+                'advanced': asdict(config.advanced)
+            }
+            with open(tpl_path, 'w', encoding='utf-8') as f:
+                json.dump(tpl, f, indent=2, ensure_ascii=False)
+            self.logger.info(f"Saved template: {tpl_path}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to save template: {e}")
+            return False
 class InputValidator:
     """Input validation and sanitization for security"""
     
@@ -1655,6 +1870,20 @@ class InputValidator:
         
         return True
 
+
+def safe_path(p: Optional[str], default: Optional[Path] = None) -> Path:
+    """Convert optional path-like strings to Path, providing a safe default.
+
+    Treat empty strings or None as default (if provided) or the current directory.
+    Returns a Path object.
+    """
+    if not p:
+        return default or Path('.')
+    try:
+        return Path(p)
+    except Exception:
+        return default or Path('.')
+
 class Py2WinMainApp(ctk.CTk):
     """Main Py2Win Premium application with modern UI and enterprise features"""
     
@@ -1709,9 +1938,9 @@ class Py2WinMainApp(ctk.CTk):
         self.create_status_bar()
         
         # Setup key bindings
-        self.bind_all("<Control-s>", lambda e: self.save_project())
-        self.bind_all("<Control-o>", lambda e: self.load_project())
-        self.bind_all("<F5>", lambda e: self.start_build())
+        self.bind_all("<Control-s>", lambda _: self.save_project())
+        self.bind_all("<Control-o>", lambda _: self.load_project())
+        self.bind_all("<F5>", lambda _: self.start_build())
     
     def create_sidebar(self):
         """Create navigation sidebar"""
@@ -2456,28 +2685,7 @@ class Py2WinMainApp(ctk.CTk):
         
         return True
     
-    def _update_config_from_ui(self):
-        """Update configuration from UI inputs"""
-        if self.wizard_mode:
-            # Update from wizard mode
-            self.current_config.build.script_path = self.wizard_script_entry.get()
-            self.current_config.build.exe_name = Path(self.wizard_script_entry.get()).stem
-            self.current_config.build.windowed = self.wizard_windowed_var.get()
-            self.current_config.build.one_file = self.wizard_onefile_var.get()
-        else:
-            # Update from advanced mode
-            self.current_config.build.script_path = self.script_entry.get()
-            self.current_config.build.exe_name = self.exe_name_entry.get()
-            self.current_config.build.output_dir = self.output_dir_entry.get()
-            self.current_config.build.icon_path = self.icon_entry.get()
-            self.current_config.build.version = self.version_entry.get()
-            self.current_config.build.company = self.company_entry.get()
-            self.current_config.build.description = self.description_entry.get()
-            self.current_config.build.one_file = self.onefile_var.get()
-            self.current_config.build.windowed = self.windowed_var.get()
-            self.current_config.build.clean_build = self.clean_var.get()
-            self.current_config.build.use_upx = self.upx_var.get()
-            self.current_config.build.backend = self.backend_var.get()
+    # (Public wrapper `_update_config_from_ui` is defined later and delegates to the implementation)
     
     # Project management
     def save_project(self):
@@ -2520,49 +2728,37 @@ class Py2WinMainApp(ctk.CTk):
         self.update_status("New project created")
     
     def _update_ui_from_config(self):
-        """Update UI from current configuration"""
-        config = self.current_config.build
-        
-        # Update wizard mode
-        self.wizard_script_entry.delete(0, tk.END)
-        self.wizard_script_entry.insert(0, config.script_path)
-        self.wizard_windowed_var.set(config.windowed)
-        self.wizard_onefile_var.set(config.one_file)
-        
-        # Update advanced mode
-        self.script_entry.delete(0, tk.END)
-        self.script_entry.insert(0, config.script_path)
-        self.exe_name_entry.delete(0, tk.END)
-        self.exe_name_entry.insert(0, config.exe_name)
-        self.output_dir_entry.delete(0, tk.END)
-        self.output_dir_entry.insert(0, config.output_dir)
-        self.icon_entry.delete(0, tk.END)
-        self.icon_entry.insert(0, config.icon_path)
-        self.version_entry.delete(0, tk.END)
-        self.version_entry.insert(0, config.version)
-        self.company_entry.delete(0, tk.END)
-        self.company_entry.insert(0, config.company)
-        self.description_entry.delete(0, tk.END)
-        self.description_entry.insert(0, config.description)
-        
-        self.onefile_var.set(config.one_file)
-        self.windowed_var.set(config.windowed)
-        self.clean_var.set(config.clean_build)
-        self.upx_var.set(config.use_upx)
-        self.backend_var.set(config.backend)
+        """Public wrapper: update UI from current configuration by delegating to implementation."""
+        impl = getattr(self, '_update_ui_impl', None)
+        if callable(impl):
+            return impl()
+        return None
+
+    def _update_config_from_ui(self):
+        """Public wrapper: update configuration from UI inputs by delegating to implementation."""
+        impl = getattr(self, '_update_config_impl', None)
+        if callable(impl):
+            return impl()
+        return None
     
     # Console management
     def start_log_polling(self):
         """Start polling for log messages"""
+        # Implement robust log polling with error handling
         try:
             while True:
                 try:
                     message = self.logger.log_queue.get_nowait()
-                    self.append_to_console(message)
+                    if not isinstance(message, str):
+                        continue
+                    self.append_to_console(str(message).strip())
                 except queue.Empty:
                     break
+                except Exception as e:
+                    print(f"Log polling error: {e}")
+                    break
         except Exception:
-            pass
+            pass  # Silently handle outer exceptions to prevent UI freezes
         
         # Schedule next poll
         self.after(100, self.start_log_polling)
@@ -2741,7 +2937,7 @@ class Py2WinMainApp(ctk.CTk):
                 self.after(0, lambda: self.update_status("Installing dependencies..."))
                 success = self.dependency_analyzer.install_packages(
                     missing,
-                    progress_callback=lambda msg: self.after(0, lambda: self.update_status(msg))
+                    progress_callback=lambda msg: (self.after(0, lambda: self.update_status(msg)), None)[1]
                 )
                 
                 if success:
@@ -3699,7 +3895,7 @@ class Py2WinMainApp(ctk.CTk):
                 target = Path(file_path).name
             
             # Add to tree and config
-            item_id = self.assets_tree.insert(
+            self.assets_tree.insert(
                 '',
                 'end',
                 text=str(len(self.current_config.build.data_paths) + 1),
@@ -3728,7 +3924,7 @@ class Py2WinMainApp(ctk.CTk):
                 target = Path(dir_path).name
             
             # Add to tree and config
-            item_id = self.assets_tree.insert(
+            _ = self.assets_tree.insert(
                 '',
                 'end',
                 text=str(len(self.current_config.build.data_paths) + 1),
@@ -3771,7 +3967,7 @@ class Py2WinMainApp(ctk.CTk):
             self.current_config.build.data_paths.clear()
             self.log_message("Cleared all assets", "INFO")
     
-    def edit_asset_target(self, event):
+    def edit_asset_target(self, _event=None):
         """Edit the target path of an asset"""
         selection = self.assets_tree.selection()
         if not selection:
@@ -3816,13 +4012,13 @@ class Py2WinMainApp(ctk.CTk):
             company=self.installer_company.get() or "",
             description=self.installer_description.get() or "",
             output_dir=self.installer_output_dir.get() or "./installer",
-            desktop_shortcut=self.installer_desktop_shortcut.get(),
-            start_menu=self.installer_start_menu.get(),
+            desktop_shortcut=bool(self.installer_desktop_shortcut.get()),
+            start_menu=bool(self.installer_start_menu.get()),
             install_dir=self.installer_install_dir.get().replace("{app_name}", self.installer_app_name.get()),
-            per_user=self.installer_per_user.get(),
-            eula_file=self.installer_eula_file.get() if self.installer_eula_file.get() else None,
-            banner_image=self.installer_banner_image.get() if self.installer_banner_image.get() else None,
-            silent_mode=self.installer_silent_mode.get()
+            per_user=bool(self.installer_per_user.get()),
+            eula_file=self.installer_eula_file.get() or None,  # Convert empty string to None
+            banner_image=self.installer_banner_image.get() or None,  # Convert empty string to None
+            silent_mode=bool(self.installer_silent_mode.get())
         )
         
         # Update status
@@ -3878,6 +4074,22 @@ class Py2WinMainApp(ctk.CTk):
         if dir_path:
             entry_widget.delete(0, tk.END)
             entry_widget.insert(0, dir_path)
+
+    def browse_icon(self):
+        """Browse for an icon file and update the icon entry widget"""
+        file_path = filedialog.askopenfilename(
+            title="Select Icon",
+            filetypes=[("Icon files", "*.ico;*.png;*.icns"), ("All files", "*")],
+            parent=self
+        )
+
+        if file_path:
+            try:
+                self.icon_entry.delete(0, tk.END)
+                self.icon_entry.insert(0, file_path)
+            except Exception:
+                # Guard against missing widget during headless/static analysis
+                self.logger.debug("icon_entry not present to update")
     
     # ============= Settings Tab Methods =============
     def change_theme(self, theme):
@@ -4182,113 +4394,17 @@ class Py2WinMainApp(ctk.CTk):
             self.json_status_label.configure(text=f"✗ Cannot format invalid JSON: {e}")
             messagebox.showerror("Format Error", f"Cannot format invalid JSON:\n{e}")
     
-    def load_template(self, template_name):
-        """Load a project template"""
-        templates = {
-            "CLI Application": {
-                "project": {
-                    "name": "My CLI App",
-                    "version": "1.0.0",
-                    "author": "Your Name",
-                    "description": "A command-line application"
-                },
-                "build": {
-                    "script_path": "",
-                    "exe_name": "my_cli_app",
-                    "output_dir": "./dist",
-                    "one_file": True,
-                    "windowed": False,
-                    "clean_build": True,
-                    "backend": "pyinstaller"
-                }
-            },
-            "GUI Application": {
-                "project": {
-                    "name": "My GUI App",
-                    "version": "1.0.0",
-                    "author": "Your Name",
-                    "description": "A graphical user interface application"
-                },
-                "build": {
-                    "script_path": "",
-                    "exe_name": "my_gui_app",
-                    "output_dir": "./dist",
-                    "one_file": True,
-                    "windowed": True,
-                    "clean_build": True,
-                    "backend": "pyinstaller",
-                    "icon_path": ""
-                }
-            },
-            "Web Service": {
-                "project": {
-                    "name": "My Web Service",
-                    "version": "1.0.0",
-                    "author": "Your Name",
-                    "description": "A web service application"
-                },
-                "build": {
-                    "script_path": "",
-                    "exe_name": "my_web_service",
-                    "output_dir": "./dist",
-                    "one_file": False,
-                    "windowed": False,
-                    "clean_build": True,
-                    "backend": "pyinstaller",
-                    "hidden_imports": ["flask", "werkzeug", "jinja2"]
-                }
-            },
-            "Data Science": {
-                "project": {
-                    "name": "My Data Science App",
-                    "version": "1.0.0",
-                    "author": "Your Name",
-                    "description": "A data science application"
-                },
-                "build": {
-                    "script_path": "",
-                    "exe_name": "my_data_app",
-                    "output_dir": "./dist",
-                    "one_file": False,
-                    "windowed": False,
-                    "clean_build": True,
-                    "backend": "pyinstaller",
-                    "hidden_imports": ["numpy", "pandas", "matplotlib", "scipy", "sklearn"]
-                }
-            },
-            "Game": {
-                "project": {
-                    "name": "My Game",
-                    "version": "1.0.0",
-                    "author": "Your Name",
-                    "description": "A game application"
-                },
-                "build": {
-                    "script_path": "",
-                    "exe_name": "my_game",
-                    "output_dir": "./dist",
-                    "one_file": True,
-                    "windowed": True,
-                    "clean_build": True,
-                    "backend": "pyinstaller",
-                    "hidden_imports": ["pygame"],
-                    "data_paths": []
-                }
-            }
-        }
+    def _load_template_to_editor(self, template_name: str, template: dict) -> None:
+        """Load a template into the JSON editor tab"""
+        # Load template into editor
+        self.json_editor.delete(1.0, tk.END)
+        self.json_editor.insert(1.0, json.dumps(template, indent=2))
         
-        if template_name in templates:
-            template = templates[template_name]
-            
-            # Load template into editor
-            self.json_editor.delete(1.0, tk.END)
-            self.json_editor.insert(1.0, json.dumps(template, indent=2))
-            
-            # Update tree view
-            self.update_json_tree(template)
-            
-            self.json_status_label.configure(text=f"✓ Loaded template: {template_name}")
-            self.log_message(f"Loaded template: {template_name}", "INFO")
+        # Update tree view
+        self.update_json_tree(template)
+        
+        self.json_status_label.configure(text=f"✓ Loaded template: {template_name}")
+        self.log_message(f"Loaded template into editor: {template_name}", "INFO")
     
     def on_json_change(self, event=None):
         """Handle changes in JSON editor"""
@@ -4501,8 +4617,8 @@ class Py2WinMainApp(ctk.CTk):
             except Exception as e:
                 self.log_message(f"Failed to save template: {e}", "ERROR")
     
-    def _update_ui_from_config(self):
-        """Update UI elements from current configuration"""
+    def _update_ui_impl(self):
+        """Update UI elements from current configuration (implementation)."""
         # Update profile menu
         self._update_profile_menu()
         
@@ -4520,19 +4636,33 @@ class Py2WinMainApp(ctk.CTk):
             self.output_dir_entry.delete(0, tk.END)
             self.output_dir_entry.insert(0, build_config.output_dir)
     
-    def _update_config_from_ui(self):
-        """Update configuration from UI elements with validation"""
-        if hasattr(self, 'wizard_script_entry'):
-            script_path = self.validator.sanitize_input(self.wizard_script_entry.get())
-            if self.validator.validate_file_path(script_path):
-                self.current_config.build.script_path = script_path
-            else:
-                self.log_message("Invalid script path", "WARNING")
-        
-        if hasattr(self, 'exe_name_entry'):
-            exe_name = self.validator.sanitize_input(self.exe_name_entry.get())
-            if self.validator.validate_executable_name(exe_name):
-                self.current_config.build.exe_name = exe_name
+    def _update_config_impl(self):
+        """Update configuration from UI inputs (implementation)."""
+        # Update based on available UI elements
+        if hasattr(self, 'wizard_mode') and self.wizard_mode:
+            # Wizard mode updates
+            if hasattr(self, 'wizard_script_entry'):
+                script_path = self.validator.sanitize_input(self.wizard_script_entry.get())
+                if self.validator.validate_file_path(script_path):
+                    self.current_config.build.script_path = script_path
+                    self.current_config.build.exe_name = Path(script_path).stem
+                
+                if hasattr(self, 'wizard_windowed_var'):
+                    self.current_config.build.windowed = bool(self.wizard_windowed_var.get())
+                
+                if hasattr(self, 'wizard_onefile_var'):
+                    self.current_config.build.one_file = bool(self.wizard_onefile_var.get())
+        else:
+            # Advanced mode updates
+            if hasattr(self, 'script_entry'):
+                script_path = self.validator.sanitize_input(self.script_entry.get())
+                if self.validator.validate_file_path(script_path):
+                    self.current_config.build.script_path = script_path
+            
+            if hasattr(self, 'exe_name_entry'):
+                exe_name = self.validator.sanitize_input(self.exe_name_entry.get())
+                if self.validator.validate_executable_name(exe_name):
+                    self.current_config.build.exe_name = exe_name
             else:
                 self.log_message("Invalid executable name", "WARNING")
         
@@ -4584,48 +4714,13 @@ class Py2WinMainApp(ctk.CTk):
         return True
     
     # ============= Additional Helper Methods =============
-    def save_project(self):
-        """Save current project configuration"""
-        if not self.current_config.project.name:
-            self.current_config.project.name = "Untitled Project"
-        
-        # Save to project manager
-        config_path = self.project_manager.save_config(self.current_config, f"{self.current_config.project.name}.py2win.json")
-        if config_path:
-            self.add_to_recent_projects(str(config_path))
-            self.log_message(f"Project saved: {config_path}", "SUCCESS")
-            messagebox.showinfo("Success", f"Project saved to:\n{config_path}")
-        else:
-            self.log_message("Failed to save project", "ERROR")
+    # Note: save_project is moved to Project Management section
     
-    def start_log_polling(self):
-        """Start polling for log messages"""
-        # This would typically read from a log queue
-        # For now, it's a placeholder for future implementation
+    def _start_log_polling_placeholder(self):
+        """Placeholder renamed to avoid duplicate with active implementation."""
         pass
     
-    def check_initial_setup(self):
-        """Check initial setup requirements"""
-        # Check for required dependencies
-        missing_deps = []
-        for package in REQUIRED_PACKAGES:
-            try:
-                __import__(package.replace("-", "_"))
-            except ImportError:
-                missing_deps.append(package)
-        
-        if missing_deps:
-            self.log_message(f"Installing missing dependencies: {', '.join(missing_deps)}", "WARNING")
-            
-            def install_deps():
-                for package in missing_deps:
-                    try:
-                        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-                        self.after(0, lambda p=package: self.log_message(f"Installed: {p}", "SUCCESS"))
-                    except Exception as e:
-                        self.after(0, lambda p=package, err=e: self.log_message(f"Failed to install {p}: {err}", "ERROR"))
-            
-            threading.Thread(target=install_deps, daemon=True).start()
+    # Note: Moved to Dependency Management section as _check_setup_worker
 
 # Utility classes for UI components
 class ModernButton(ctk.CTkButton):
@@ -4670,17 +4765,7 @@ def install_missing_dependencies():
                 print(f"✗ Failed to install {package}: {e}")
                 return False
     
-    # Also ensure pywin32 for Windows DPAPI
-    if sys.platform == 'win32':
-        try:
-            import win32crypt  # type: ignore
-        except ImportError:
-            print("Installing pywin32 for secure storage...")
-            try:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "pywin32"])
-                print("✓ Installed pywin32")
-            except Exception as e:
-                print(f"✗ Failed to install pywin32: {e}")
+    # Note: win32crypt import is already handled at module level
     
     # Check for optional packages
     for package in OPTIONAL_PACKAGES:
@@ -4756,9 +4841,9 @@ Examples:
             with open(parsed_args.config, 'r') as f:
                 config_dict = json.load(f)
             config = ProjectConfig.from_dict(config_dict)
-            logger.log(f"Loaded configuration from {parsed_args.config}", "INFO")
+            logger.info(f"Loaded configuration from {parsed_args.config}")
         except Exception as e:
-            logger.log(f"Failed to load configuration: {e}", "ERROR")
+            logger.error(f"Failed to load configuration: {e}")
             return 1
     else:
         # Create from command line arguments
@@ -4804,9 +4889,9 @@ Examples:
         try:
             with open(parsed_args.save_config, 'w') as f:
                 json.dump(asdict(config), f, indent=2, default=str)
-            logger.log(f"Configuration saved to {parsed_args.save_config}", "SUCCESS")
+            logger.info(f"Configuration saved to {parsed_args.save_config}")
         except Exception as e:
-            logger.log(f"Failed to save configuration: {e}", "ERROR")
+            logger.error(f"Failed to save configuration: {e}")
             return 1
     
     # Perform requested actions
@@ -4815,7 +4900,7 @@ Examples:
     # Analyze dependencies
     if parsed_args.analyze_deps:
         if not config.build.script_path:
-            logger.log("No script specified for dependency analysis", "ERROR")
+            logger.error("No script specified for dependency analysis")
             return 1
         
         print("\n=== Dependency Analysis ===")
@@ -4843,7 +4928,7 @@ Examples:
     # Detect hidden imports
     if parsed_args.detect_imports:
         if not config.build.script_path:
-            logger.log("No script specified for import detection", "ERROR")
+            logger.error("No script specified for import detection")
             return 1
         
         print("\n=== Hidden Import Detection ===")
@@ -4868,7 +4953,7 @@ Examples:
     # Build executable
     if parsed_args.build:
         if not config.build.script_path:
-            logger.log("No script specified for building", "ERROR")
+            logger.error("No script specified for building")
             return 1
         
         print(f"\n=== Building {config.build.exe_name or 'executable'} ===")
@@ -4877,9 +4962,11 @@ Examples:
         print(f"Output: {config.build.output_dir}")
         
         orchestrator = BuildOrchestrator()
-        success, output_path = orchestrator.build(config.build)
-        
+        success = orchestrator.build(config.build)
+        output_path = None
         if success:
+            # Derive expected output path
+            output_path = Path(config.build.output_dir) / (config.build.exe_name or "")
             print(f"\n✓ Build successful!")
             print(f"Executable: {output_path}")
         else:
@@ -4889,7 +4976,7 @@ Examples:
     # Create installer
     if parsed_args.installer:
         if not config.build.exe_name:
-            logger.log("No executable name specified for installer", "ERROR")
+            logger.error("No executable name specified for installer")
             return 1
         
         print(f"\n=== Creating NSIS Installer ===")

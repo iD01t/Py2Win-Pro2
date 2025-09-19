@@ -1,3 +1,5 @@
 {
-    "python.analysis.typeCheckingMode": "standard"
+    "python.analysis.typeCheckingMode": "standard",
+    "git.autofetch": true,
+    "typescript.disableAutomaticTypeAcquisition": true
 }

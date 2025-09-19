@@ -10,8 +10,9 @@ setuptools>=68.0.0
 wheel>=0.41.0
 tomli>=2.0.0; python_version < "3.11"
 
-# Windows-specific (for secure storage)
-pywin32>=306; sys_platform == 'win32'
+# Security & Storage
+pywin32>=306; sys_platform == 'win32'  # Windows DPAPI
+cryptography>=41.0.0  # Fallback encryption
 
 # Optional Build Backends
 nuitka>=1.8.0  # Alternative compiler (optional)
