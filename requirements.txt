@@ -1,0 +1,36 @@
+# Py2Win Premium Requirements
+# Python 3.8 or higher required
+
+# Core Dependencies
+pyinstaller>=6.0.0
+customtkinter>=5.2.0
+pillow>=10.0.0
+requests>=2.31.0
+setuptools>=68.0.0
+wheel>=0.41.0
+tomli>=2.0.0; python_version < "3.11"
+
+# Windows-specific (for secure storage)
+pywin32>=306; sys_platform == 'win32'
+
+# Optional Build Backends
+nuitka>=1.8.0  # Alternative compiler (optional)
+
+# Optional Compression
+# Note: UPX must be downloaded separately from https://upx.github.io/
+
+# Development Dependencies (optional)
+pytest>=7.4.0
+pytest-cov>=4.1.0
+black>=23.0.0
+pylint>=2.17.0
+
+# Additional Framework Support (install as needed)
+# flask>=3.0.0  # For Flask applications
+# django>=4.2.0  # For Django applications
+# numpy>=1.24.0  # For scientific applications
+# pandas>=2.0.0  # For data analysis
+# matplotlib>=3.7.0  # For plotting
+# pygame>=2.5.0  # For game development
+# PyQt5>=5.15.0  # For Qt applications
+# kivy>=2.2.0  # For Kivy applications

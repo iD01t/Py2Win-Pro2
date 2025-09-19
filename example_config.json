@@ -1,0 +1,57 @@
+{
+  "project": {
+    "name": "Example Application",
+    "version": "1.0.0",
+    "author": "Your Name",
+    "description": "An example Python application",
+    "license": "MIT",
+    "url": "https://github.com/yourusername/yourproject"
+  },
+  "build": {
+    "script_path": "main.py",
+    "exe_name": "ExampleApp",
+    "output_dir": "./dist",
+    "one_file": true,
+    "windowed": false,
+    "clean_build": true,
+    "icon_path": "",
+    "hidden_imports": [],
+    "exclude_modules": [],
+    "data_paths": [],
+    "use_upx": false,
+    "backend": "pyinstaller",
+    "version": "1.0.0"
+  },
+  "advanced": {
+    "optimization_level": 1,
+    "debug_mode": false,
+    "console_mode": true,
+    "admin_required": false,
+    "bundle_logs": false,
+    "strip_debug": true,
+    "custom_hooks": []
+  },
+  "signing": null,
+  "installer": {
+    "app_name": "Example Application",
+    "version": "1.0.0",
+    "company": "Your Company",
+    "description": "An example Python application",
+    "license_file": null,
+    "output_dir": "./installer",
+    "icon_path": null,
+    "desktop_shortcut": true,
+    "start_menu": true,
+    "install_dir": "$PROGRAMFILES\\ExampleApp",
+    "per_user": false,
+    "run_after": false,
+    "eula_file": null,
+    "banner_image": null,
+    "silent_mode": false
+  },
+  "metadata": {
+    "created_date": "2025-01-01T00:00:00",
+    "modified_date": "2025-01-01T00:00:00",
+    "py2win_version": "5.0.0"
+  }
+}
