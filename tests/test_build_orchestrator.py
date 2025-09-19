@@ -8,10 +8,10 @@ import tempfile
 import shutil
 from pathlib import Path
 import sys
-import os
+from os.path import dirname, abspath
 
 # Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, dirname(dirname(abspath(__file__))))
 
 from py2win_premium_v5 import BuildOrchestrator, BuildConfig, ProjectConfig
 
@@ -86,7 +86,7 @@ if __name__ == "__main__":
             hidden_imports=["requests", "numpy"]
         )
         
-        cmd = self.orchestrator._build_pyinstaller_command(config)
+        cmd = self.orchestrator._build_pyinstaller_command(config, None)
         
         self.assertIn("pyinstaller", cmd[0])
         self.assertIn("--onefile", cmd)

@@ -16,7 +16,7 @@ def run_tests():
     # Discover and run tests
     loader = unittest.TestLoader()
     start_dir = Path(__file__).parent / "tests"
-    suite = loader.discover(start_dir, pattern="test_*.py")
+    suite = loader.discover(str(start_dir), pattern="test_*.py")
     
     # Run tests
     runner = unittest.TextTestRunner(verbosity=2)

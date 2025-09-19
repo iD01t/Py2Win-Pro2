@@ -5,10 +5,10 @@ Unit tests for ProjectTemplates class
 
 import unittest
 import sys
-import os
+from os.path import dirname, abspath
 
 # Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, dirname(dirname(abspath(__file__))))
 
 from py2win_premium_v5 import ProjectTemplates, ProjectConfig
 
@@ -31,7 +31,7 @@ class TestProjectTemplates(unittest.TestCase):
         """Test template structure is correct"""
         templates = ProjectTemplates.get_templates()
         
-        for template_name, template in templates.items():
+        for _template_name, template in templates.items():
             self.assertIn("project", template)
             self.assertIn("build", template)
             self.assertIn("advanced", template)

@@ -561,7 +561,7 @@ class DependencyAnalyzer:
             return str(pip_path)
         return "pip"
     
-    def full_diagnosis(self, script_path: Optional[str] = None) -> Dict[str, Any]:
+    def full_diagnosis(self, _script_path: Optional[str] = None) -> Dict[str, Any]:
         """Comprehensive dependency analysis"""
         results = {
             'python_version': self._check_python_version(),
@@ -3786,8 +3786,8 @@ class Py2WinMainApp(ctk.CTk):
         
         # Bind events
         self.json_editor.bind('<KeyRelease>', self.on_json_change)
-        self.json_editor.bind('<Control-s>', lambda e: self.export_json_config())
-        self.json_editor.bind('<Control-o>', lambda e: self.import_json_config())
+        self.json_editor.bind('<Control-s>', lambda _e: self.export_json_config())
+        self.json_editor.bind('<Control-o>', lambda _e: self.import_json_config())
         
         # Load current configuration into editor
         self.load_current_config_to_json()
@@ -4406,7 +4406,7 @@ class Py2WinMainApp(ctk.CTk):
         self.json_status_label.configure(text=f"✓ Loaded template: {template_name}")
         self.log_message(f"Loaded template into editor: {template_name}", "INFO")
     
-    def on_json_change(self, event=None):
+    def on_json_change(self, _event=None):
         """Handle changes in JSON editor"""
         try:
             json_content = self.json_editor.get(1.0, tk.END).strip()
